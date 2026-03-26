@@ -1,123 +1,134 @@
 # NDS-TOTP
 
-A TOTP (Time-Based One-Time Password) authenticator application for the Nintendo DS, ported from Simple C TOTP : https://github.com/msantos/totp.c.
+A TOTP authenticator for Nintendo DS/DSi with encrypted token storage and touchscreen 3x3 pattern unlock. Ported from [Simple C TOTP](https://github.com/msantos/totp.c).
+
+## Version
+
+- **V2** (current): encrypted vault + pattern unlock + on-device QR import from DSi camera.
 
 ## Features
 
-- **Configurable Time Correction**: Handle DS clock drift with adjustable time offset
-- **SD Card Support**: Load tokens from `totp/tokens.txt` on your SD card
-- **Quick Exit**: Press START button to return to the menu
+- RFC 6238-compliant TOTP (6 digits).
+- HMAC-SHA1 cryptography.
+- Encrypted token vault in `/totp/tokens.bin`.
+- 3x3 pattern lock screen on touchscreen before token display.
+- Dual-screen UI:
+  - Top: diagnostics and active token info.
+  - Bottom: service list (5 visible) and large current code.
+- `START` quick exit.
+- QR import directly on DSi camera (`Y`).
+- Safe delete flow in-app:
+  - `X` arms deletion
+  - `Y` confirms deletion
+  - pressing `X` again cancels deletion
 
-## Hardware Requirements
+## Requirements
 
-- Nintendo DS / DSi with homebrew loader
-- SD card with homebrew capability
-- devkitARM toolchain (for building)
+- Nintendo DS / DSi with homebrew loader.
+- SD card.
+- devkitARM + libnds for DS build.
+- host `gcc` for the token packer tool.
 
-## Building
+## Build
 
 ```bash
 make
+make packer
 ```
 
-This generates `nds-totp.nds` ready for deployment.
+Outputs:
 
-## Installation
+- `nds-totp.nds` (DS application)
+- `tools/totp-pack` (host utility)
 
-1. Copy `nds-totp.nds` to your DS
-2. Create a `totp/` folder on your SD card (or place tokens.txt in an existing one)
-3. Add your tokens to `totp/tokens.txt`
+## Create encrypted token file
 
-## Configuration
+Commands:
 
-### Token Format
-
-Create a file `totp/tokens.txt` with the following format (pipe-delimited):
-
-```txt
-label|base32_secret|interval_seconds|unix_epoch_t0
+```bash
+tools/totp-pack add  /path/to/tokens.bin <pattern> <label> <base32_secret> [interval] [t0]
+tools/totp-pack set  /path/to/tokens.bin <pattern> <label> <base32_secret> [interval] [t0]
+tools/totp-pack del  /path/to/tokens.bin <pattern> <label> [--yes]
+tools/totp-pack rename /path/to/tokens.bin <pattern> <old_label> <new_label>
+tools/totp-pack list /path/to/tokens.bin <pattern>
 ```
 
-#### Example
+Pattern rules:
 
-```txt
-GitHub|JBSWY3DPEBLW64TMMQ======|30|0
-MyEmail|OBWGC2LOFVZXG53POJZXG53POJZXG53P|30|0
+- digits `1..9`
+- no duplicates
+- minimum length: 4
+
+Mapping:
+
+```text
+1 2 3
+4 5 6
+7 8 9
 ```
 
-### Time Correction
+Example:
 
-If your DS runs ahead or behind the correct time, add this line to `tokens.txt`:
-
-```txt
-time_correction=-3600
+```bash
+tools/totp-pack add ./tokens.bin 14789 GitHub JBSWY3DPEBLW64TMMQ====== 30 0
+tools/totp-pack add ./tokens.bin 14789 Email  OBWGC2LOFVZXG53POJZXG53POJZXG53P 30 0
+tools/totp-pack rename ./tokens.bin 14789 Email WorkMail
+tools/totp-pack set ./tokens.bin 14789 WorkMail  JBSWY3DPEHPK3PXP 30 0
+tools/totp-pack del ./tokens.bin 14789 GitHub
+tools/totp-pack list ./tokens.bin 14789
 ```
 
-This offsets the system clock by the specified number of seconds. Common values:
+Important:
 
-- `-3600` for 1 hour ahead
-- `+3600` for 1 hour behind
+- One `tokens.bin` uses one unlock pattern for all entries.
+- Mixing different patterns in the same file is rejected.
+- `del` asks for confirmation (`Y` or `yes`). Use `--yes` to skip prompt.
+
+## Install on SD
+
+1. Copy `nds-totp.nds` to your DS launcher location.
+2. Copy `tokens.bin` to `/totp/tokens.bin` on SD.
+3. Launch app and draw the same pattern to unlock.
 
 ## Controls
 
-| Button | Action |
-| ------ | ------ |
-| UP / DOWN | Navigate service list |
-| A | Reload tokens from SD card |
-| L / R | Reload tokens from SD card |
-| START | Return to menu |
+- Touchscreen: Draw unlock pattern
+- UP / DOWN: Navigate service list
+- A: Reload encrypted tokens
+- L / R: Reload encrypted tokens
+- X: Arm deletion for selected entry
+- Y: Confirm deletion (after X), otherwise scan `otpauth://...` from DSi camera
+- START: Exit app
 
-## Display Layout
+## Notes
 
-### Top Screen
+- This V2 stores encrypted entries in `tokens.bin`.
+- Tokens are decrypted in RAM only after successful unlock.
+- Keep your pattern secret; anyone with SD + pattern can decrypt tokens.
+- QR scan (`Y`) requires DSi mode and uses the built-in camera.
 
-- System time (raw and adjusted)
-- Time correction offset applied
-- Currently selected token details (code, refresh countdown, counter, interval)
-- Quick help (UP/DOWN to select, A to reload)
+## Credits
 
-### Bottom Screen
-
-- **Top**: System time info
-- **Middle**: Scrollable list of 5 services at a time
-- **Bottom**: Centered 6-digit OTP code
-
-## Technical Details
-
-### Cryptographic Stack
-
-- **HMAC-SHA1**: Custom implementation using Steve Reid's public domain SHA-1
-- **Base32 Decoding**: RFC 4648 compliant with proper padding validation
-- **Counter Mode**: RFC 6238 time-step counter: `counter = (now - t0) / interval`
-
-### NDS-Specific
-
-- Dual-screen console via libnds
-- SD card access via libfat
-- Cross-compiled for ARM9 with devkitARM
+- Original TOTP C project: Michael Santos — [msantos/totp.c](https://github.com/msantos/totp.c)
+- QR decoding library: Daniel Beer — [dlbeer/quirc](https://github.com/dlbeer/quirc)
+- DSi camera integration library: Epicpkmn11 — [Epicpkmn11/dsi-camera](https://github.com/Epicpkmn11/dsi-camera)
+- SHA-1 / HMAC implementation used in this project is based on code credited in source headers to Michael Santos and David M. Syzdek.
 
 ## Troubleshooting
 
-**No tokens appear**: Ensure `tokens.txt` is placed at `/totp/tokens.txt` on your SD card and the file format is correct.
+- No tokens: verify `/totp/tokens.bin` exists.
+- Unlock fails: pattern must match exactly the one used with `totp-pack`.
+- Wrong OTP time: adjust `TIME_CORRECTION_SECONDS` in [totp.c](totp.c).
 
-**Wrong codes generated**: Check your time correction offset. Use the top screen to see the raw and adjusted system times.
+## Changelog (V1 -> V2)
 
-**Time stuck at 0**: Set the DS clock in system settings before launching the app.
-
-## License
-
-This port combines:
-
-- Original TOTP algorithm concept and base code
-- Steve Reid's public domain SHA-1 implementation
-- libnds and devkitARM toolchain
-
-See individual source files for detailed attribution.
-
-## Author
-
-Ported by Tristan LAROCHE, with the help of GitHub Copilot (2026)
-
----
-
-**Note**: This application is for personal use only. Always keep your OTP secrets safe and never share your `tokens.txt` file.
+- Added encrypted vault workflow centered on `/totp/tokens.bin`.
+- Added touchscreen 3x3 pattern unlock before token access.
+- Added in-app QR import from DSi camera (`Y`).
+- Added safer in-app deletion flow:
+  - `X` arms deletion
+  - `Y` confirms deletion
+  - second `X` cancels deletion
+- Added host management improvements in `totp-pack` (safer delete flow and clearer commands).
+- Updated dual-screen UX and status messages.
+- Integrated and credited third-party components for QR and DSi camera support.
