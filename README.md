@@ -1,6 +1,6 @@
 # NDS-TOTP
 
-A TOTP (Time-Based One-Time Password) authenticator application for the Nintendo DS, ported from Simple C TOTP: Time-Based One-Time Password Algorithm by Michael Santos <michael.santos@gmail.com> and  M. Syzdek <david@syzdek.net>.
+A TOTP (Time-Based One-Time Password) authenticator application for the Nintendo DS, ported from Simple C TOTP : https://github.com/msantos/totp.c.
 
 ## Features
 
