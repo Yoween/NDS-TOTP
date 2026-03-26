@@ -1,0 +1,18 @@
+# Build outputs
+*.o
+*.elf
+*.nds
+*.lst
+
+# Common local/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# VS Code local settings
+.vscode/
+
+# Local test data (do not commit secrets)
+/tools/tokens.bin
+/totp/tokens.bin
