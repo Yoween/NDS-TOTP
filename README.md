@@ -124,6 +124,13 @@ Important:
 - DSi camera integration library: Epicpkmn11 — [Epicpkmn11/dsi-camera](https://github.com/Epicpkmn11/dsi-camera)
 - SHA-1 / HMAC implementation used in this project is based on code credited in source headers to Michael Santos and David M. Syzdek.
 
+## License
+
+This project is licensed under **GNU General Public License v3.0 or later**.
+
+- Full text: [LICENSE](LICENSE)
+- Third-party notices and attribution: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+
 ## Troubleshooting
 
 - No tokens: verify `/totp/tokens.bin` exists.
