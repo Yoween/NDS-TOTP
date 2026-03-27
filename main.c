@@ -49,7 +49,7 @@ int main(void) {
   selected = 0;
   loaded_path = NULL;
   app.status_msg[0] = '\0';
-  app.time_correction_seconds = 0;
+  app.time_correction_seconds = -3600;
 
   if (gui_unlock_and_load_tokens(&app, tokens, &token_count, &loaded_path) < 0) {
     consoleSelect(&app.top_console);
