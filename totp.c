@@ -5,75 +5,12 @@
  *  All rights reserved.
  */
 
-#include <fat.h>
+#include "totp.h"
+
 #include <hmac/hmac.h>
-#include <nds.h>
-#include <quirc.h>
-#include <stdarg.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-#include <calico/nds/pxi.h>
-#include "camera.h"
-
-#define MAX_TOKENS 32
-#define MAX_LABEL_LEN 63
-#define MAX_KEY_LEN 64
-#define LINE_BUF_LEN 256
-#define TOKEN_BIN_MAGIC "NTB1"
-#define TOKEN_BIN_VERSION 1
-#define TOKEN_SALT_LEN 16
-#define TOKEN_NONCE_LEN 8
-#define TOKEN_TAG_LEN 16
-#define PATTERN_MIN_POINTS 4
-#define PATTERN_MAX_POINTS 9
-#define KDF_ROUNDS 2048
-
-/* Touch pattern calibration */
-#define TOUCH_CELL_W_DIV 3
-#define TOUCH_CELL_H_DIV 4
-#define TOUCH_HIT_W_PERCENT 32
-#define TOUCH_HIT_H_PERCENT 32
-
-/* Bottom screen list layout tuning */
-#define UI_TOP_INFO_ROWS 2
-#define UI_LIST_TOP_PADDING_ROWS 2
-#define UI_CODE_ROW 22
-#define UI_GAP_BEFORE_CODE_ROWS 2
-#define UI_LABEL_COLS 30
-#define UI_SERVICE_GAP_ROWS 1
-#define CONSOLE_COLS 32
-
-/* Unlock pattern grid layout (console rows/cols) */
-#define UNLOCK_GRID_TOP_ROW 6
-#define UNLOCK_GRID_LEFT_COL 4
-#define UNLOCK_GRID_ROW_STEP 6
-#define UNLOCK_GRID_COL_STEP 10
-
-#define QR_DETECT_ONLY 0
-
-/*
- * Manual correction applied to time(NULL) before TOTP computation.
- * Example: if the DS runs +3600s ahead, set to -3600.
- */
-#define TIME_CORRECTION_SECONDS -3600
-
-static int g_time_correction_seconds = TIME_CORRECTION_SECONDS;
-
-static PrintConsole g_top_console;
-static PrintConsole g_bottom_console;
-static uint8_t g_enc_key[20];
-static uint8_t g_mac_key[20];
-static int g_has_unlocked_keys = 0;
-static char g_status_msg[96];
-static struct quirc_code g_qr_code;
-static struct quirc_data g_qr_data;
-
-#define QR_FRAME_W 256
-#define QR_FRAME_H 192
 
 static const int8_t base32_vals[256] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -93,17 +30,7 @@ static const int8_t base32_vals[256] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
 };
 
-typedef struct token_s {
-  char label[MAX_LABEL_LEN + 1];
-  uint8_t key[MAX_KEY_LEN];
-  size_t key_len;
-  uint32_t interval;
-  int64_t t0;
-} token_t;
-
-
-
-static int parse_time_correction_line(const char *line, int *value) {
+int parse_time_correction_line(const char *line, int *value) {
   const char *eq;
   long parsed;
 
@@ -126,7 +53,7 @@ static int parse_time_correction_line(const char *line, int *value) {
 
 
 
-static char *trim(char *s) {
+char *trim(char *s) {
   char *end;
 
   while ((*s == ' ') || (*s == '\t') || (*s == '\r') || (*s == '\n'))
@@ -144,8 +71,8 @@ static char *trim(char *s) {
   return s;
 }
 
-static int base32_decode(const char *in, uint8_t *out, size_t out_cap,
-                         size_t *out_len) {
+int base32_decode(const char *in, uint8_t *out, size_t out_cap,
+                  size_t *out_len) {
   size_t len;
   size_t pos;
   size_t keylen;
@@ -231,7 +158,7 @@ static int base32_decode(const char *in, uint8_t *out, size_t out_cap,
   return 0;
 }
 
-static uint32_t compute_totp(const token_t *token, time_t now) {
+uint32_t compute_totp(const token_t *token, time_t now) {
   uint64_t counter;
   uint8_t msg[8] = {0};
   uint8_t hmac_result[20] = {0};
@@ -270,72 +197,7 @@ static uint32_t compute_totp(const token_t *token, time_t now) {
   return bin_code % 1000000;
 }
 
-static uint16_t read_u16_le(FILE *fp, int *ok) {
-  uint8_t b[2];
-  if ((fread(b, 1, 2, fp) != 2) || (*ok == 0)) {
-    *ok = 0;
-    return 0;
-  }
-  return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
-}
-
-static uint32_t read_u32_le(FILE *fp, int *ok) {
-  uint8_t b[4];
-  if ((fread(b, 1, 4, fp) != 4) || (*ok == 0)) {
-    *ok = 0;
-    return 0;
-  }
-  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
-         ((uint32_t)b[3] << 24);
-}
-
-static int64_t read_i64_le(FILE *fp, int *ok) {
-  uint8_t b[8];
-  uint64_t v;
-  if ((fread(b, 1, 8, fp) != 8) || (*ok == 0)) {
-    *ok = 0;
-    return 0;
-  }
-  v = (uint64_t)b[0] | ((uint64_t)b[1] << 8) | ((uint64_t)b[2] << 16) |
-      ((uint64_t)b[3] << 24) | ((uint64_t)b[4] << 32) | ((uint64_t)b[5] << 40) |
-      ((uint64_t)b[6] << 48) | ((uint64_t)b[7] << 56);
-  return (int64_t)v;
-}
-
-static void hmac20(const uint8_t *key, size_t key_len, const uint8_t *msg,
-                   size_t msg_len, uint8_t out[20]) {
-  size_t out_len = 20;
-  hmac_sha1(key, key_len, msg, msg_len, out, &out_len);
-}
-
-static void derive_keys_from_pattern(const uint8_t *pattern, size_t pattern_len,
-                                     const uint8_t salt[TOKEN_SALT_LEN],
-                                     uint8_t enc_key[20],
-                                     uint8_t mac_key[20]) {
-  uint8_t seed[20];
-  uint8_t msg[TOKEN_SALT_LEN + 2];
-  uint16_t i;
-
-  if ((pattern_len == 0) || (pattern_len > PATTERN_MAX_POINTS)) {
-    memset(enc_key, 0, 20);
-    memset(mac_key, 0, 20);
-    return;
-  }
-
-  memcpy(msg, salt, TOKEN_SALT_LEN);
-  msg[TOKEN_SALT_LEN] = (uint8_t)pattern_len;
-  msg[TOKEN_SALT_LEN + 1] = 0xA5;
-  hmac20(pattern, pattern_len, msg, sizeof(msg), seed);
-
-  for (i = 0; i < KDF_ROUNDS; i++) {
-    msg[TOKEN_SALT_LEN] = (uint8_t)(i & 0xFF);
-    msg[TOKEN_SALT_LEN + 1] = (uint8_t)(((i >> 8) & 0xFF) ^ 0x5A);
-    hmac20(seed, sizeof(seed), msg, sizeof(msg), seed);
-  }
-
-  hmac20(seed, sizeof(seed), (const uint8_t *)"enc", 3, enc_key);
-  hmac20(seed, sizeof(seed), (const uint8_t *)"mac", 3, mac_key);
-}
+#if 0
 
 static void stream_xor(const uint8_t enc_key[20],
                        const uint8_t nonce[TOKEN_NONCE_LEN], uint8_t *buf,
@@ -1951,3 +1813,5 @@ int main(void) {
     swiWaitForVBlank();
   }
 }
+
+#endif

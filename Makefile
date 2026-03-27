@@ -26,28 +26,28 @@ HOSTCC := gcc
 PACKER := tools/totp-pack
 ARM7_APP_ELF := $(TARGET)-arm7.elf
 
-SRCS := totp.c hmac/hmac_sha1.c sha/sha1.c \
-	third_party/dsi-camera/arm9/source/camera.c \
-	third_party/quirc/lib/quirc.c \
-	third_party/quirc/lib/decode.c \
-	third_party/quirc/lib/identify.c \
-	third_party/quirc/lib/version_db.c
+SRCS := main.c gui.c crypto.c camera_scan.c qr.c totp.c hmac/hmac_sha1.c sha/sha1.c \
+	dsi_camera/arm9/source/camera.c \
+	quirc/lib/quirc.c \
+	quirc/lib/decode.c \
+	quirc/lib/identify.c \
+	quirc/lib/version_db.c
 OBJS := $(SRCS:.c=.o)
 
-ARM7_SRCS := third_party/dsi-camera/arm7/source/main.c \
-	third_party/dsi-camera/arm7/source/i2c_handler.c \
-	third_party/dsi-camera/arm7/source/aptina.c \
-	third_party/dsi-camera/arm7/source/aptina_i2c.c
+ARM7_SRCS := dsi_camera/arm7/source/main.c \
+	dsi_camera/arm7/source/i2c_handler.c \
+	dsi_camera/arm7/source/aptina.c \
+	dsi_camera/arm7/source/aptina_i2c.c
 
 INCLUDES := -I. -Ihmac -Isha -I$(LIBNDS)/include -I$(CALICO)/include -I$(DEVKITPRO)/portlibs/nds/include \
-	-Ithird_party/dsi-camera/arm9/include -Ithird_party/dsi-camera/shared/include -Ithird_party/quirc/lib
+	-Idsi_camera/arm9/include -Idsi_camera/shared/include -Iquirc/lib
 ARCH := -march=armv5te -mtune=arm946e-s -mthumb
 CFLAGS := -O2 -Wall -Wextra $(ARCH) -ffunction-sections -fdata-sections -DARM9 -D__NDS__ $(INCLUDES)
 LDFLAGS := -specs=$(CALICO)/share/ds9.specs $(ARCH) -L$(CALICO)/lib -L$(LIBNDS)/lib -L$(DEVKITPRO)/portlibs/nds/lib
 LIBS := -lnds9 -lfilesystem -lfat -lcalico_ds9 -lm
 
 INCLUDES7 := -I. -I$(LIBNDS)/include -I$(CALICO)/include -I$(DEVKITPRO)/portlibs/nds/include \
-	-Ithird_party/dsi-camera/arm7/include -Ithird_party/dsi-camera/shared/include
+	-Idsi_camera/arm7/include -Idsi_camera/shared/include
 ARCH7 := -march=armv4t -mtune=arm7tdmi -mthumb
 CFLAGS7 := -O2 -Wall -Wextra $(ARCH7) -ffunction-sections -fdata-sections -DARM7 -D__NDS__ $(INCLUDES7)
 LDFLAGS7 := -specs=$(CALICO)/share/ds7.specs $(ARCH7) -L$(CALICO)/lib -L$(LIBNDS)/lib -L$(DEVKITPRO)/portlibs/nds/lib

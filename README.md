@@ -4,7 +4,7 @@ A TOTP authenticator for Nintendo DS/DSi with encrypted token storage and touchs
 
 ## Version
 
-- **V2** (current): encrypted vault + pattern unlock + on-device QR import from DSi camera.
+- **V2.1** (current): modularized codebase + normalized library layout + stable on-device QR import.
 
 ## Features
 
@@ -102,7 +102,7 @@ Important:
 
 ## Notes
 
-- This V2 stores encrypted entries in `tokens.bin`.
+- This V2.1 stores encrypted entries in `tokens.bin`.
 - Tokens are decrypted in RAM only after successful unlock.
 - Keep your pattern secret; anyone with SD + pattern can decrypt tokens.
 - QR scan (`Y`) requires DSi mode and uses the built-in camera.
@@ -118,7 +118,31 @@ Important:
 
 - No tokens: verify `/totp/tokens.bin` exists.
 - Unlock fails: pattern must match exactly the one used with `totp-pack`.
-- Wrong OTP time: adjust `TIME_CORRECTION_SECONDS` in [totp.c](totp.c).
+- Wrong OTP time: adjust `TIME_CORRECTION_SECONDS` in [totp.c](totp.c). (Will be changed in later release)
+
+## Changelog (V2 -> V2.1)
+
+- Refactored the monolithic code into modules with headers:
+  - `main.c`
+  - `gui.c` + `gui.h`
+  - `crypto.c` + `crypto.h`
+  - `totp.c` + `totp.h`
+  - `camera_scan.c` + `camera_scan.h`
+  - `qr.c` + `qr.h`
+  - `app.h` (shared types/constants)
+- Moved vendored libraries out of `third_party/` into top-level normalized folders:
+  - `dsi_camera/`
+  - `quirc/`
+- Updated build integration in `Makefile` for the new source/include paths.
+- Preserved the in-app UX features introduced in V2 (safe delete flow, status messages, QR import controls).
+- Kept the QR decode stability fix (stack-heavy decode workspace moved out of small runtime stack in quirc).
+
+### Migration structure (old -> new)
+
+- `totp.c` (monolithic) -> `main.c` + `gui.c` + `crypto.c` + `camera_scan.c` + `qr.c` + `totp.c`
+- `third_party/dsi-camera/...` -> `dsi_camera/...`
+- `third_party/quirc/...` -> `quirc/...`
+- Shared app globals/constants -> `app.h`
 
 ## Changelog (V1 -> V2)
 
