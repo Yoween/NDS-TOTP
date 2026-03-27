@@ -22,6 +22,16 @@ A TOTP authenticator for Nintendo DS/DSi with encrypted token storage and touchs
   - `Y` confirms deletion
   - pressing `X` again cancels deletion
 
+## Screenshots
+
+### Unlock screen
+
+![Unlock screen](images/first_screen.jpg)
+
+### Main TOTP screen
+
+![Main TOTP screen](images/main_screen.jpg)
+
 ## Requirements
 
 - Nintendo DS / DSi with homebrew loader.

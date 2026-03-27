@@ -1,0 +1,6 @@
+*.o
+*.elf
+*.lst
+tools/tokens.bin
+*.nds
+tools/totp-pack
