@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include "crypto.h"
 
 #include <hmac/hmac.h>
@@ -5,32 +7,111 @@
 #include <string.h>
 #include <time.h>
 
+/*
+ * Encrypted vault format implementation.
+ *
+ * Security notes:
+ * - authentication tags are checked in constant-time
+ * - intermediate secret material is explicitly wiped when possible
+ * - v2 (pattern+PIN) is required by policy at key-derivation level
+ */
+
+static void secure_zero(void *ptr, size_t len) {
+  volatile uint8_t *p = (volatile uint8_t *)ptr;
+  while (len-- > 0)
+    *p++ = 0;
+}
+
+static int ct_memeq(const uint8_t *a, const uint8_t *b, size_t len) {
+  uint8_t diff = 0;
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    diff |= (uint8_t)(a[i] ^ b[i]);
+
+  return diff == 0;
+}
+
 static void hmac20(const uint8_t *key, size_t key_len, const uint8_t *msg,
                    size_t msg_len, uint8_t out[20]) {
   size_t out_len = 20;
   hmac_sha1(key, key_len, msg, msg_len, out, &out_len);
 }
 
-void derive_keys_from_pattern(const uint8_t *pattern, size_t pattern_len,
-                              const uint8_t salt[TOKEN_SALT_LEN],
-                              uint8_t enc_key[20], uint8_t mac_key[20]) {
-  uint8_t seed[20];
+static void derive_seed_from_secret(const uint8_t *secret, size_t secret_len,
+                                    const uint8_t salt[TOKEN_SALT_LEN],
+                                    uint8_t out_seed[20]) {
   uint8_t msg[TOKEN_SALT_LEN + 2];
   uint16_t i;
 
   memcpy(msg, salt, TOKEN_SALT_LEN);
-  msg[TOKEN_SALT_LEN] = (uint8_t)pattern_len;
+  msg[TOKEN_SALT_LEN] = (uint8_t)secret_len;
   msg[TOKEN_SALT_LEN + 1] = 0xA5;
-  hmac20(pattern, pattern_len, msg, sizeof(msg), seed);
+  hmac20(secret, secret_len, msg, sizeof(msg), out_seed);
 
   for (i = 0; i < KDF_ROUNDS; i++) {
     msg[TOKEN_SALT_LEN] = (uint8_t)(i & 0xFF);
     msg[TOKEN_SALT_LEN + 1] = (uint8_t)(((i >> 8) & 0xFF) ^ 0x5A);
-    hmac20(seed, sizeof(seed), msg, sizeof(msg), seed);
+    hmac20(out_seed, 20, msg, sizeof(msg), out_seed);
   }
+
+  secure_zero(msg, sizeof(msg));
+}
+
+void derive_keys_from_pattern(const uint8_t *pattern, size_t pattern_len,
+                              const uint8_t salt[TOKEN_SALT_LEN],
+                              uint8_t enc_key[20], uint8_t mac_key[20]) {
+  uint8_t seed[20];
+
+  derive_seed_from_secret(pattern, pattern_len, salt, seed);
 
   hmac20(seed, sizeof(seed), (const uint8_t *)"enc", 3, enc_key);
   hmac20(seed, sizeof(seed), (const uint8_t *)"mac", 3, mac_key);
+  secure_zero(seed, sizeof(seed));
+}
+
+static void derive_keys_from_pattern_and_pin(
+    const uint8_t *pattern, size_t pattern_len, const char *pin,
+    const uint8_t salt[TOKEN_SALT_LEN], const uint8_t pin_salt[TOKEN_PIN_SALT_LEN],
+    uint8_t enc_key[20], uint8_t mac_key[20]) {
+  uint8_t pattern_seed[20];
+  uint8_t pin_seed[20];
+  uint8_t mix[24];
+  uint8_t master[20];
+
+  derive_seed_from_secret(pattern, pattern_len, salt, pattern_seed);
+  derive_seed_from_secret((const uint8_t *)pin, strlen(pin), pin_salt, pin_seed);
+
+  memcpy(mix, pin_seed, 20);
+  memcpy(mix + 20, "bind", 4);
+  hmac20(pattern_seed, sizeof(pattern_seed), mix, sizeof(mix), master);
+  hmac20(master, sizeof(master), (const uint8_t *)"enc", 3, enc_key);
+  hmac20(master, sizeof(master), (const uint8_t *)"mac", 3, mac_key);
+
+  secure_zero(pattern_seed, sizeof(pattern_seed));
+  secure_zero(pin_seed, sizeof(pin_seed));
+  secure_zero(mix, sizeof(mix));
+  secure_zero(master, sizeof(master));
+}
+
+int derive_keys_for_vault(const vault_meta_t *meta, const uint8_t *pattern,
+                          size_t pattern_len, const char *pin,
+                          uint8_t enc_key[20], uint8_t mac_key[20]) {
+  if ((meta == NULL) || (pattern == NULL) || (pattern_len == 0))
+    return -1;
+
+  if (meta->version == TOKEN_BIN_VERSION_V1)
+    return -1;
+
+  if (meta->version == TOKEN_BIN_VERSION_V2) {
+    if ((pin == NULL) || (pin[0] == '\0'))
+      return -1;
+    derive_keys_from_pattern_and_pin(pattern, pattern_len, pin, meta->salt,
+                                     meta->pin_salt, enc_key, mac_key);
+    return 0;
+  }
+
+  return -1;
 }
 
 static uint16_t read_u16_le(FILE *fp, int *ok) {
@@ -84,6 +165,9 @@ static void stream_xor(const uint8_t enc_key[20],
 
     counter++;
   }
+
+  secure_zero(block, sizeof(block));
+  secure_zero(msg, sizeof(msg));
 }
 
 static void compute_entry_tag(const uint8_t mac_key[20], uint8_t label_len,
@@ -121,11 +205,25 @@ static void compute_entry_tag(const uint8_t mac_key[20], uint8_t label_len,
 
 static void make_entry_nonce(const uint8_t enc_key[20],
                              uint8_t nonce[TOKEN_NONCE_LEN]) {
-  uint8_t msg[12];
+  uint8_t msg[32];
   uint8_t out[20];
+  uint8_t seed[20];
   static uint32_t counter = 0;
+  static uint8_t state[20];
+  static int state_ready = 0;
+  FILE *ur;
+  size_t got;
   uint32_t t = (uint32_t)time(NULL);
   uint32_t mix = t ^ ((uint32_t)REG_VCOUNT << 16) ^ (counter * 0x9E3779B9u);
+
+  /* Use OS RNG when available (host-side/test environments). */
+  ur = fopen("/dev/urandom", "rb");
+  if (ur != NULL) {
+    got = fread(nonce, 1, TOKEN_NONCE_LEN, ur);
+    fclose(ur);
+    if (got == TOKEN_NONCE_LEN)
+      return;
+  }
 
   msg[0] = (uint8_t)(t & 0xFF);
   msg[1] = (uint8_t)((t >> 8) & 0xFF);
@@ -139,10 +237,90 @@ static void make_entry_nonce(const uint8_t enc_key[20],
   msg[9] = (uint8_t)((counter >> 8) & 0xFF);
   msg[10] = (uint8_t)((counter >> 16) & 0xFF);
   msg[11] = (uint8_t)((counter >> 24) & 0xFF);
-  counter++;
+  msg[12] = (uint8_t)(clock() & 0xFF);
+  msg[13] = (uint8_t)((clock() >> 8) & 0xFF);
+  msg[14] = (uint8_t)((clock() >> 16) & 0xFF);
+  msg[15] = (uint8_t)((clock() >> 24) & 0xFF);
 
+  if (!state_ready) {
+    hmac20(enc_key, 20, msg, 16, state);
+    state_ready = 1;
+  }
+
+  memcpy(msg + 16, state, 16);
   hmac20(enc_key, 20, msg, sizeof(msg), out);
   memcpy(nonce, out, TOKEN_NONCE_LEN);
+
+  memcpy(seed, out, sizeof(seed));
+  seed[0] ^= (uint8_t)(counter & 0xFF);
+  seed[1] ^= (uint8_t)((counter >> 8) & 0xFF);
+  hmac20(enc_key, 20, seed, sizeof(seed), state);
+  counter++;
+
+  secure_zero(out, sizeof(out));
+  secure_zero(seed, sizeof(seed));
+  secure_zero(msg, sizeof(msg));
+}
+
+int read_tokens_bin_meta(vault_meta_t *meta, const char **loaded_path) {
+  static const char *paths[] = {
+      "sd:/totp/tokens.bin",
+      "fat:/totp/tokens.bin",
+      "/totp/tokens.bin",
+  };
+  FILE *fp = NULL;
+  uint8_t magic[4];
+  uint8_t version;
+  size_t idx;
+
+  if (meta == NULL)
+    return -1;
+
+  memset(meta, 0, sizeof(*meta));
+  if (loaded_path != NULL)
+    *loaded_path = NULL;
+
+  /* Try all supported mount points; first readable file wins. */
+  for (idx = 0; idx < (sizeof(paths) / sizeof(paths[0])); idx++) {
+    fp = fopen(paths[idx], "rb");
+    if (fp != NULL) {
+      if (loaded_path != NULL)
+        *loaded_path = paths[idx];
+      break;
+    }
+  }
+
+  if (fp == NULL)
+    return -1;
+
+  if ((fread(magic, 1, 4, fp) != 4) || (fread(&version, 1, 1, fp) != 1) ||
+      (fread(meta->salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)) {
+    fclose(fp);
+    return -1;
+  }
+
+  if ((magic[0] != TOKEN_BIN_MAGIC[0]) || (magic[1] != TOKEN_BIN_MAGIC[1]) ||
+      (magic[2] != TOKEN_BIN_MAGIC[2]) || (magic[3] != TOKEN_BIN_MAGIC[3])) {
+    fclose(fp);
+    return -1;
+  }
+
+  meta->version = version;
+  meta->pin_required = 0;
+
+  if (version == TOKEN_BIN_VERSION_V2) {
+    if (fread(meta->pin_salt, 1, TOKEN_PIN_SALT_LEN, fp) != TOKEN_PIN_SALT_LEN) {
+      fclose(fp);
+      return -1;
+    }
+    meta->pin_required = 1;
+  } else if (version != TOKEN_BIN_VERSION_V1) {
+    fclose(fp);
+    return -1;
+  }
+
+  fclose(fp);
+  return 0;
 }
 
 int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
@@ -158,6 +336,7 @@ int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
   uint8_t magic[4];
   uint8_t version;
   uint8_t salt[TOKEN_SALT_LEN];
+  uint8_t pin_salt[TOKEN_PIN_SALT_LEN];
   uint16_t entry_count;
   size_t idx;
   int ok = 1;
@@ -185,10 +364,14 @@ int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
 
   if (fread(&version, 1, 1, fp) != 1)
     ok = 0;
-  if (version != TOKEN_BIN_VERSION)
+  if ((version != TOKEN_BIN_VERSION_V1) && (version != TOKEN_BIN_VERSION_V2))
     ok = 0;
 
   if (fread(salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)
+    ok = 0;
+
+  if ((version == TOKEN_BIN_VERSION_V2) &&
+      (fread(pin_salt, 1, TOKEN_PIN_SALT_LEN, fp) != TOKEN_PIN_SALT_LEN))
     ok = 0;
 
   entry_count = read_u16_le(fp, &ok);
@@ -196,7 +379,12 @@ int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
     fclose(fp);
     return -2;
   }
+  if (entry_count > MAX_TOKENS) {
+    fclose(fp);
+    return -2;
+  }
 
+  /* Full pass verifies MAC before exposing decrypted payload to caller. */
   for (e = 0; e < entry_count; e++) {
     uint8_t nonce[TOKEN_NONCE_LEN];
     uint8_t label_len;
@@ -209,7 +397,6 @@ int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
     uint8_t expected_tag[20];
     token_t token;
     size_t payload_len;
-    size_t i;
 
     if (fread(nonce, 1, TOKEN_NONCE_LEN, fp) != TOKEN_NONCE_LEN)
       ok = 0;
@@ -235,12 +422,8 @@ int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
 
     compute_entry_tag(mac_key, label_len, key_len, interval, t0, nonce, cipher,
                       payload_len, expected_tag);
-    for (i = 0; i < TOKEN_TAG_LEN; i++) {
-      if (tag[i] != expected_tag[i]) {
-        ok = 0;
-        break;
-      }
-    }
+    if (!ct_memeq(tag, expected_tag, TOKEN_TAG_LEN))
+      ok = 0;
     if (!ok)
       break;
 
@@ -262,46 +445,20 @@ int load_tokens_bin_with_keys(token_t *tokens, size_t *count,
   }
 
   fclose(fp);
+  secure_zero(salt, sizeof(salt));
+  secure_zero(pin_salt, sizeof(pin_salt));
   return ok ? 0 : -2;
 }
 
 int read_tokens_bin_salt(uint8_t out_salt[TOKEN_SALT_LEN],
                          const char **loaded_path) {
-  static const char *paths[] = {
-      "sd:/totp/tokens.bin",
-      "fat:/totp/tokens.bin",
-      "/totp/tokens.bin",
-  };
-  FILE *fp = NULL;
-  uint8_t magic[4];
-  uint8_t version;
-  size_t idx;
+  vault_meta_t meta;
 
-  *loaded_path = NULL;
-
-  for (idx = 0; idx < (sizeof(paths) / sizeof(paths[0])); idx++) {
-    fp = fopen(paths[idx], "rb");
-    if (fp != NULL) {
-      *loaded_path = paths[idx];
-      break;
-    }
-  }
-
-  if (fp == NULL)
+  if (read_tokens_bin_meta(&meta, loaded_path) < 0)
     return -1;
 
-  if ((fread(magic, 1, 4, fp) != 4) || (fread(&version, 1, 1, fp) != 1) ||
-      (fread(out_salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)) {
-    fclose(fp);
-    return -1;
-  }
-
-  fclose(fp);
-  if ((magic[0] != TOKEN_BIN_MAGIC[0]) || (magic[1] != TOKEN_BIN_MAGIC[1]) ||
-      (magic[2] != TOKEN_BIN_MAGIC[2]) || (magic[3] != TOKEN_BIN_MAGIC[3]) ||
-      (version != TOKEN_BIN_VERSION))
-    return -1;
-
+  memcpy(out_salt, meta.salt, TOKEN_SALT_LEN);
+  secure_zero(&meta, sizeof(meta));
   return 0;
 }
 
@@ -312,6 +469,7 @@ int append_token_bin_entry(const char *bin_path, const token_t *token,
   uint8_t magic[4];
   uint8_t version;
   uint8_t salt[TOKEN_SALT_LEN];
+  uint8_t pin_salt[TOKEN_PIN_SALT_LEN];
   uint8_t c[2];
   uint16_t count;
   uint16_t new_count;
@@ -337,15 +495,25 @@ int append_token_bin_entry(const char *bin_path, const token_t *token,
     return -1;
 
   if ((fread(magic, 1, 4, fp) != 4) || (fread(&version, 1, 1, fp) != 1) ||
-      (fread(salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN) ||
-      (fread(c, 1, 2, fp) != 2)) {
+      (fread(salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)) {
     fclose(fp);
     return -1;
   }
 
   if ((magic[0] != TOKEN_BIN_MAGIC[0]) || (magic[1] != TOKEN_BIN_MAGIC[1]) ||
       (magic[2] != TOKEN_BIN_MAGIC[2]) || (magic[3] != TOKEN_BIN_MAGIC[3]) ||
-      (version != TOKEN_BIN_VERSION)) {
+      ((version != TOKEN_BIN_VERSION_V1) && (version != TOKEN_BIN_VERSION_V2))) {
+    fclose(fp);
+    return -1;
+  }
+
+  if ((version == TOKEN_BIN_VERSION_V2) &&
+      (fread(pin_salt, 1, TOKEN_PIN_SALT_LEN, fp) != TOKEN_PIN_SALT_LEN)) {
+    fclose(fp);
+    return -1;
+  }
+
+  if (fread(c, 1, 2, fp) != 2) {
     fclose(fp);
     return -1;
   }
@@ -398,7 +566,11 @@ int append_token_bin_entry(const char *bin_path, const token_t *token,
 
   c[0] = (uint8_t)(new_count & 0xFF);
   c[1] = (uint8_t)((new_count >> 8) & 0xFF);
-  if (fseek(fp, 4 + 1 + TOKEN_SALT_LEN, SEEK_SET) != 0) {
+  if (fseek(fp,
+            (version == TOKEN_BIN_VERSION_V2)
+                ? (4 + 1 + TOKEN_SALT_LEN + TOKEN_PIN_SALT_LEN)
+                : (4 + 1 + TOKEN_SALT_LEN),
+            SEEK_SET) != 0) {
     fclose(fp);
     return -1;
   }
@@ -408,19 +580,24 @@ int append_token_bin_entry(const char *bin_path, const token_t *token,
   }
 
   fclose(fp);
+  secure_zero(salt, sizeof(salt));
+  secure_zero(pin_salt, sizeof(pin_salt));
   return 0;
 }
 
-int rewrite_tokens_bin_with_keys(const char *bin_path,
-                                 const uint8_t salt[TOKEN_SALT_LEN],
-                                 const uint8_t enc_key[20],
-                                 const uint8_t mac_key[20],
-                                 const token_t *tokens, size_t count) {
+int rewrite_tokens_bin_with_keys_meta(const char *bin_path,
+                                      const vault_meta_t *meta,
+                                      const uint8_t enc_key[20],
+                                      const uint8_t mac_key[20],
+                                      const token_t *tokens, size_t count) {
   FILE *fp;
   uint8_t count_le[2];
   size_t i;
 
-  if (count > 65535)
+  if ((meta == NULL) || (count > 65535))
+    return -1;
+  if ((meta->version != TOKEN_BIN_VERSION_V1) &&
+      (meta->version != TOKEN_BIN_VERSION_V2))
     return -1;
 
   fp = fopen(bin_path, "wb");
@@ -431,8 +608,11 @@ int rewrite_tokens_bin_with_keys(const char *bin_path,
   count_le[1] = (uint8_t)((count >> 8) & 0xFF);
 
   if ((fwrite(TOKEN_BIN_MAGIC, 1, 4, fp) != 4) ||
-      (fputc(TOKEN_BIN_VERSION, fp) == EOF) ||
-      (fwrite(salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN) ||
+  (fputc(meta->version, fp) == EOF) ||
+  (fwrite(meta->salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN) ||
+  ((meta->version == TOKEN_BIN_VERSION_V2) &&
+   (fwrite(meta->pin_salt, 1, TOKEN_PIN_SALT_LEN, fp) !=
+    TOKEN_PIN_SALT_LEN)) ||
       (fwrite(count_le, 1, 2, fp) != 2)) {
     fclose(fp);
     return -1;
@@ -496,4 +676,20 @@ int rewrite_tokens_bin_with_keys(const char *bin_path,
 
   fclose(fp);
   return 0;
+}
+
+int rewrite_tokens_bin_with_keys(const char *bin_path,
+                                 const uint8_t salt[TOKEN_SALT_LEN],
+                                 const uint8_t enc_key[20],
+                                 const uint8_t mac_key[20],
+                                 const token_t *tokens, size_t count) {
+  vault_meta_t meta;
+
+  memset(&meta, 0, sizeof(meta));
+  meta.version = TOKEN_BIN_VERSION_V1;
+  meta.pin_required = 0;
+  memcpy(meta.salt, salt, TOKEN_SALT_LEN);
+
+  return rewrite_tokens_bin_with_keys_meta(bin_path, &meta, enc_key, mac_key,
+                                           tokens, count);
 }

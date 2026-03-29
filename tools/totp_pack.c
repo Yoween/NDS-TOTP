@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include <ctype.h>
 #include <errno.h>
 #include <stddef.h>
@@ -7,12 +9,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Host-side vault management tool.
+ *
+ * Responsibilities:
+ * - parse/validate CLI input (pattern, PIN, labels, secrets)
+ * - decrypt existing vault, mutate entries, rewrite encrypted vault atomically
+ * - enforce project security policy (v2+PIN, weak secret rejection by default)
+ */
+
 #define TOKEN_BIN_MAGIC "NTB1"
-#define TOKEN_BIN_VERSION 1
+#define TOKEN_BIN_VERSION_V1 1
+#define TOKEN_BIN_VERSION_V2 2
 #define TOKEN_SALT_LEN 16
+#define TOKEN_PIN_SALT_LEN 16
 #define TOKEN_NONCE_LEN 8
 #define TOKEN_TAG_LEN 16
+#define PATTERN_MIN_POINTS 5
 #define PATTERN_MAX_POINTS 9
+#define PIN_MIN_LEN 4
+#define PIN_MAX_LEN 8
 #define KDF_ROUNDS 2048
 #define MAX_LABEL_LEN 63
 #define MAX_KEY_LEN 64
@@ -119,27 +135,93 @@ static void hmac20(const uint8_t *key, size_t key_len, const uint8_t *msg,
   hmac_sha1(key, key_len, msg, msg_len, out, &out_len);
 }
 
+static int ct_memeq(const uint8_t *a, const uint8_t *b, size_t len) {
+  uint8_t diff = 0;
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    diff |= (uint8_t)(a[i] ^ b[i]);
+
+  return diff == 0;
+}
+
+typedef struct vault_meta_s {
+  uint8_t version;
+  int pin_required;
+  uint8_t salt[TOKEN_SALT_LEN];
+  uint8_t pin_salt[TOKEN_PIN_SALT_LEN];
+} vault_meta_t;
+
+static void derive_seed_from_secret(const uint8_t *secret, size_t secret_len,
+                                    const uint8_t salt[TOKEN_SALT_LEN],
+                                    uint8_t out_seed[20]) {
+  uint8_t msg[TOKEN_SALT_LEN + 2];
+  uint16_t i;
+
+  memcpy(msg, salt, TOKEN_SALT_LEN);
+  msg[TOKEN_SALT_LEN] = (uint8_t)secret_len;
+  msg[TOKEN_SALT_LEN + 1] = 0xA5;
+  hmac20(secret, secret_len, msg, sizeof(msg), out_seed);
+
+  for (i = 0; i < KDF_ROUNDS; i++) {
+    msg[TOKEN_SALT_LEN] = (uint8_t)(i & 0xFF);
+    msg[TOKEN_SALT_LEN + 1] = (uint8_t)(((i >> 8) & 0xFF) ^ 0x5A);
+    hmac20(out_seed, 20, msg, sizeof(msg), out_seed);
+  }
+}
+
 static void derive_keys_from_pattern(const uint8_t *pattern, size_t pattern_len,
                                      const uint8_t salt[TOKEN_SALT_LEN],
                                      uint8_t enc_key[20],
                                      uint8_t mac_key[20]) {
   uint8_t seed[20];
-  uint8_t msg[TOKEN_SALT_LEN + 2];
-  uint16_t i;
 
-  memcpy(msg, salt, TOKEN_SALT_LEN);
-  msg[TOKEN_SALT_LEN] = (uint8_t)pattern_len;
-  msg[TOKEN_SALT_LEN + 1] = 0xA5;
-  hmac20(pattern, pattern_len, msg, sizeof(msg), seed);
-
-  for (i = 0; i < KDF_ROUNDS; i++) {
-    msg[TOKEN_SALT_LEN] = (uint8_t)(i & 0xFF);
-    msg[TOKEN_SALT_LEN + 1] = (uint8_t)(((i >> 8) & 0xFF) ^ 0x5A);
-    hmac20(seed, sizeof(seed), msg, sizeof(msg), seed);
-  }
+  derive_seed_from_secret(pattern, pattern_len, salt, seed);
 
   hmac20(seed, sizeof(seed), (const uint8_t *)"enc", 3, enc_key);
   hmac20(seed, sizeof(seed), (const uint8_t *)"mac", 3, mac_key);
+}
+
+static void derive_keys_from_pattern_and_pin(
+    const uint8_t *pattern, size_t pattern_len, const char *pin,
+    const uint8_t salt[TOKEN_SALT_LEN], const uint8_t pin_salt[TOKEN_PIN_SALT_LEN],
+    uint8_t enc_key[20], uint8_t mac_key[20]) {
+  uint8_t pattern_seed[20];
+  uint8_t pin_seed[20];
+  uint8_t mix[24];
+  uint8_t master[20];
+
+  derive_seed_from_secret(pattern, pattern_len, salt, pattern_seed);
+  derive_seed_from_secret((const uint8_t *)pin, strlen(pin), pin_salt, pin_seed);
+
+  memcpy(mix, pin_seed, 20);
+  memcpy(mix + 20, "bind", 4);
+  hmac20(pattern_seed, sizeof(pattern_seed), mix, sizeof(mix), master);
+  hmac20(master, sizeof(master), (const uint8_t *)"enc", 3, enc_key);
+  hmac20(master, sizeof(master), (const uint8_t *)"mac", 3, mac_key);
+}
+
+static int derive_keys_for_meta(const vault_meta_t *meta,
+                                const uint8_t *pattern, size_t pattern_len,
+                                const char *pin, uint8_t enc_key[20],
+                                uint8_t mac_key[20]) {
+  if ((meta == NULL) || (pattern == NULL) || (pattern_len == 0))
+    return -1;
+
+  if (meta->version == TOKEN_BIN_VERSION_V1) {
+    derive_keys_from_pattern(pattern, pattern_len, meta->salt, enc_key, mac_key);
+    return 0;
+  }
+
+  if (meta->version == TOKEN_BIN_VERSION_V2) {
+    if ((pin == NULL) || (pin[0] == '\0'))
+      return -1;
+    derive_keys_from_pattern_and_pin(pattern, pattern_len, pin, meta->salt,
+                                     meta->pin_salt, enc_key, mac_key);
+    return 0;
+  }
+
+  return -1;
 }
 
 static void stream_xor(const uint8_t enc_key[20],
@@ -203,7 +285,7 @@ static int parse_pattern(const char *s, uint8_t out[PATTERN_MAX_POINTS],
   uint8_t used[9] = {0};
   size_t n = strlen(s);
 
-  if ((n < 4) || (n > PATTERN_MAX_POINTS))
+  if ((n < PATTERN_MIN_POINTS) || (n > PATTERN_MAX_POINTS))
     return -1;
 
   for (i = 0; i < n; i++) {
@@ -219,6 +301,105 @@ static int parse_pattern(const char *s, uint8_t out[PATTERN_MAX_POINTS],
   return 0;
 }
 
+static int pattern_is_weak(const uint8_t pattern[PATTERN_MAX_POINTS],
+                           size_t pattern_len) {
+  size_t i;
+  int seq_dir = 0;
+  int same_row = 1;
+  int same_col = 1;
+  int main_diag = 1;
+  int anti_diag = 1;
+
+  if (pattern_len < PATTERN_MIN_POINTS)
+    return 1;
+
+  for (i = 1; i < pattern_len; i++) {
+    int prev = (int)pattern[i - 1];
+    int cur = (int)pattern[i];
+    int diff = cur - prev;
+
+    if (diff == 1) {
+      if (seq_dir == 0)
+        seq_dir = 1;
+      else if (seq_dir != 1)
+        seq_dir = 2;
+    } else if (diff == -1) {
+      if (seq_dir == 0)
+        seq_dir = -1;
+      else if (seq_dir != -1)
+        seq_dir = 2;
+    } else {
+      seq_dir = 2;
+    }
+  }
+
+  if ((seq_dir == 1) || (seq_dir == -1))
+    return 1;
+
+  for (i = 0; i < pattern_len; i++) {
+    int v = (int)pattern[i];
+    int r = v / 3;
+    int c = v % 3;
+    int r0 = (int)pattern[0] / 3;
+    int c0 = (int)pattern[0] % 3;
+
+    if (r != r0)
+      same_row = 0;
+    if (c != c0)
+      same_col = 0;
+    if (r != c)
+      main_diag = 0;
+    if ((r + c) != 2)
+      anti_diag = 0;
+  }
+
+  if (same_row || same_col || main_diag || anti_diag)
+    return 1;
+
+  return 0;
+}
+
+static int validate_pin(const char *pin) {
+  size_t i;
+  size_t n;
+
+  if (pin == NULL)
+    return -1;
+
+  n = strlen(pin);
+  if ((n < PIN_MIN_LEN) || (n > PIN_MAX_LEN))
+    return -1;
+
+  for (i = 0; i < n; i++) {
+    if ((pin[i] < '0') || (pin[i] > '9'))
+      return -1;
+  }
+
+  return 0;
+}
+
+static int pin_is_weak(const char *pin) {
+  size_t i;
+  size_t n = strlen(pin);
+  int all_same = 1;
+  int asc = 1;
+  int desc = 1;
+
+  if (n == 0)
+    return 1;
+
+  for (i = 1; i < n; i++) {
+    if (pin[i] != pin[0])
+      all_same = 0;
+    if ((pin[i] - pin[i - 1]) != 1)
+      asc = 0;
+    if ((pin[i - 1] - pin[i]) != 1)
+      desc = 0;
+  }
+
+  return all_same || asc || desc;
+}
+
 static int fill_random(uint8_t *buf, size_t len) {
   FILE *fp = fopen("/dev/urandom", "rb");
   if (fp == NULL)
@@ -231,38 +412,58 @@ static int fill_random(uint8_t *buf, size_t len) {
   return 0;
 }
 
-static int read_header(FILE *fp, uint8_t salt[TOKEN_SALT_LEN], uint16_t *count) {
+static int read_header(FILE *fp, vault_meta_t *meta, uint16_t *count) {
   uint8_t magic[4];
   uint8_t version;
   uint8_t c[2];
 
-  if ((fread(magic, 1, 4, fp) != 4) || (fread(&version, 1, 1, fp) != 1) ||
-      (fread(salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN) ||
-      (fread(c, 1, 2, fp) != 2)) {
+  if ((meta == NULL) ||
+      (fread(magic, 1, 4, fp) != 4) || (fread(&version, 1, 1, fp) != 1) ||
+      (fread(meta->salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)) {
     return -1;
   }
 
   if ((magic[0] != TOKEN_BIN_MAGIC[0]) || (magic[1] != TOKEN_BIN_MAGIC[1]) ||
-      (magic[2] != TOKEN_BIN_MAGIC[2]) || (magic[3] != TOKEN_BIN_MAGIC[3]) ||
-      (version != TOKEN_BIN_VERSION)) {
+      (magic[2] != TOKEN_BIN_MAGIC[2]) || (magic[3] != TOKEN_BIN_MAGIC[3])) {
     return -1;
   }
+
+  meta->version = version;
+  meta->pin_required = 0;
+  memset(meta->pin_salt, 0, sizeof(meta->pin_salt));
+
+  if (version == TOKEN_BIN_VERSION_V2) {
+    if (fread(meta->pin_salt, 1, TOKEN_PIN_SALT_LEN, fp) != TOKEN_PIN_SALT_LEN)
+      return -1;
+    meta->pin_required = 1;
+  } else if (version != TOKEN_BIN_VERSION_V1) {
+    return -1;
+  }
+
+  if (fread(c, 1, 2, fp) != 2)
+    return -1;
 
   *count = (uint16_t)c[0] | ((uint16_t)c[1] << 8);
   return 0;
 }
 
-static int write_header(FILE *fp, const uint8_t salt[TOKEN_SALT_LEN],
-                        uint16_t count) {
+static int write_header(FILE *fp, const vault_meta_t *meta, uint16_t count) {
   uint8_t c[2];
+
+  if (meta == NULL)
+    return -1;
+
   c[0] = (uint8_t)(count & 0xFF);
   c[1] = (uint8_t)((count >> 8) & 0xFF);
 
   if (fwrite(TOKEN_BIN_MAGIC, 1, 4, fp) != 4)
     return -1;
-  if (fputc(TOKEN_BIN_VERSION, fp) == EOF)
+  if (fputc(meta->version, fp) == EOF)
     return -1;
-  if (fwrite(salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)
+  if (fwrite(meta->salt, 1, TOKEN_SALT_LEN, fp) != TOKEN_SALT_LEN)
+    return -1;
+  if ((meta->version == TOKEN_BIN_VERSION_V2) &&
+      (fwrite(meta->pin_salt, 1, TOKEN_PIN_SALT_LEN, fp) != TOKEN_PIN_SALT_LEN))
     return -1;
   if (fwrite(c, 1, 2, fp) != 2)
     return -1;
@@ -313,7 +514,6 @@ static int load_decrypted_entries(FILE *fp, uint16_t count,
     uint32_t interval;
     int64_t t0;
     size_t payload_len;
-    size_t i;
 
     if ((fread(nonce, 1, TOKEN_NONCE_LEN, fp) != TOKEN_NONCE_LEN) ||
         (fread(lens, 1, 2, fp) != 2) || (fread(interval_le, 1, 4, fp) != 4) ||
@@ -340,10 +540,8 @@ static int load_decrypted_entries(FILE *fp, uint16_t count,
 
     compute_entry_tag(mac_key, label_len, key_len, interval, t0, nonce, cipher,
                       payload_len, expected_tag);
-    for (i = 0; i < TOKEN_TAG_LEN; i++) {
-      if (tag[i] != expected_tag[i])
-        return -2;
-    }
+    if (!ct_memeq(tag, expected_tag, TOKEN_TAG_LEN))
+      return -2;
 
     if (n < max_entries) {
       memcpy(plain, cipher, payload_len);
@@ -365,7 +563,7 @@ static int load_decrypted_entries(FILE *fp, uint16_t count,
 }
 
 static int write_vault_file(const char *file_path,
-                            const uint8_t salt[TOKEN_SALT_LEN],
+                            const vault_meta_t *meta,
                             const uint8_t enc_key[20],
                             const uint8_t mac_key[20],
                             const vault_entry_t *entries, size_t count) {
@@ -379,7 +577,7 @@ static int write_vault_file(const char *file_path,
   if (fp == NULL)
     return -1;
 
-  if (write_header(fp, salt, (uint16_t)count) < 0) {
+  if (write_header(fp, meta, (uint16_t)count) < 0) {
     fclose(fp);
     return -1;
   }
@@ -525,11 +723,17 @@ static int read_yes_confirmation(void) {
 }
 
 int main(int argc, char **argv) {
+  char *filtered_argv[20];
+  int filtered_argc = 0;
+  int argi;
   const char *cmd;
   const char *file_path;
   const char *pattern_s;
+  const char *new_pattern_s = NULL;
   const char *label = NULL;
   const char *new_label = NULL;
+  const char *pin_opt = NULL;
+  const char *new_pin_opt = NULL;
   char label_clean[MAX_LABEL_LEN + 1];
   char new_label_clean[MAX_LABEL_LEN + 1];
   const char *secret_b32 = NULL;
@@ -537,11 +741,14 @@ int main(int argc, char **argv) {
   int64_t t0 = 0;
   uint8_t pattern[PATTERN_MAX_POINTS];
   size_t pattern_len = 0;
+  uint8_t new_pattern[PATTERN_MAX_POINTS];
+  size_t new_pattern_len = 0;
   uint8_t key_bin[MAX_KEY_LEN];
   size_t key_len = 0;
-  uint8_t salt[TOKEN_SALT_LEN];
   uint8_t enc_key[20];
   uint8_t mac_key[20];
+  uint8_t old_enc_key[20];
+  uint8_t old_mac_key[20];
   vault_entry_t entries[256];
   vault_entry_t new_entry;
   FILE *fp;
@@ -549,7 +756,56 @@ int main(int argc, char **argv) {
   size_t entry_count = 0;
   int existing = 0;
   int assume_yes = 0;
+  int allow_weak_pattern = 0;
+  int allow_weak_pin = 0;
+  int upgraded_to_v2 = 0;
   int idx;
+  int migrate_cmd = 0;
+  int rekey_cmd = 0;
+  const char *target_pin = NULL;
+  vault_meta_t meta;
+  vault_meta_t target_meta;
+
+  memset(&meta, 0, sizeof(meta));
+
+  if (argc > 0) {
+    filtered_argv[filtered_argc++] = argv[0];
+  }
+
+  for (argi = 1; argi < argc; argi++) {
+    if (strcmp(argv[argi], "--allow-weak-pattern") == 0) {
+      allow_weak_pattern = 1;
+      continue;
+    }
+    if (strcmp(argv[argi], "--allow-weak-pin") == 0) {
+      allow_weak_pin = 1;
+      continue;
+    }
+    if (strcmp(argv[argi], "--pin") == 0) {
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "Missing value for --pin\n");
+        return 1;
+      }
+      pin_opt = argv[++argi];
+      continue;
+    }
+    if (strcmp(argv[argi], "--new-pin") == 0) {
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "Missing value for --new-pin\n");
+        return 1;
+      }
+      new_pin_opt = argv[++argi];
+      continue;
+    }
+
+    if (filtered_argc >= (int)(sizeof(filtered_argv) / sizeof(filtered_argv[0]))) {
+      fprintf(stderr, "Too many arguments\n");
+      return 1;
+    }
+    filtered_argv[filtered_argc++] = argv[argi];
+  }
+  argc = filtered_argc;
+  argv = filtered_argv;
 
   if (argc < 2) {
     fprintf(stderr,
@@ -559,8 +815,16 @@ int main(int argc, char **argv) {
             "  %s del <tokens.bin> <pattern> <label> [--yes]\n"
             "  %s rename <tokens.bin> <pattern> <old_label> <new_label>\n"
             "  %s list <tokens.bin> <pattern>\n"
+            "  %s migrate <tokens.bin> <pattern> <new_pin>\n"
+            "  %s rekey <tokens.bin> <old_pattern> [new_pattern] [--pin <old_pin>] [--new-pin <new_pin>]\n"
+            "Options:\n"
+            "  --allow-weak-pattern   allow obvious patterns (not recommended)\n"
+            "  --pin <digits>         PIN for v2 vault (4 to 8 digits)\n"
+            "  --new-pin <digits>     new PIN for rekey on v2 vault\n"
+            "  --allow-weak-pin       allow obvious PINs (not recommended)\n"
             "(compat) %s <tokens.bin> <pattern> <label> <base32_secret> [interval] [t0]\n",
-            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+            argv[0]);
     return 1;
   }
 
@@ -589,9 +853,9 @@ int main(int argc, char **argv) {
     pattern_s = argv[3];
     label = argv[4];
     if (argc == 6) {
-      if (strcmp(argv[5], "--yes") == 0) {
+      if (strcmp(argv[5], "--yes") == 0)
         assume_yes = 1;
-      } else {
+      else {
         fprintf(stderr, "Unknown option for del: %s\n", argv[5]);
         return 1;
       }
@@ -612,8 +876,25 @@ int main(int argc, char **argv) {
     }
     file_path = argv[2];
     pattern_s = argv[3];
+  } else if (strcmp(cmd, "migrate") == 0) {
+    if (argc != 5) {
+      fprintf(stderr, "Invalid arguments for migrate\n");
+      return 1;
+    }
+    migrate_cmd = 1;
+    file_path = argv[2];
+    pattern_s = argv[3];
+    pin_opt = argv[4];
+  } else if (strcmp(cmd, "rekey") == 0) {
+    if ((argc != 4) && (argc != 5)) {
+      fprintf(stderr, "Invalid arguments for rekey\n");
+      return 1;
+    }
+    rekey_cmd = 1;
+    file_path = argv[2];
+    pattern_s = argv[3];
+    new_pattern_s = (argc == 5) ? argv[4] : argv[3];
   } else {
-    /* Backward compatibility: old syntax means add */
     if ((argc >= 5) && (argc <= 7)) {
       cmd = "add";
       file_path = argv[1];
@@ -627,7 +908,7 @@ int main(int argc, char **argv) {
     } else {
       fprintf(stderr,
               "Unknown command: %s\n"
-              "Use one of: add, set, del, remove, rm, rename, list\n",
+              "Use one of: add, set, del, remove, rm, rename, list, migrate, rekey\n",
               cmd);
       return 1;
     }
@@ -635,7 +916,60 @@ int main(int argc, char **argv) {
 
   if (parse_pattern(pattern_s, pattern, &pattern_len) < 0) {
     fprintf(stderr,
-            "Invalid pattern. Use digits 1..9 without repetition (min 4).\n");
+            "Invalid pattern. Use digits 1..9 without repetition (min %d).\n",
+            PATTERN_MIN_POINTS);
+    return 1;
+  }
+
+  if (pattern_is_weak(pattern, pattern_len) && !allow_weak_pattern) {
+    fprintf(stderr,
+            "Weak pattern rejected (obvious sequence/line).\n"
+            "Choose a less predictable pattern or pass --allow-weak-pattern.\n");
+    return 1;
+  }
+
+  if (rekey_cmd) {
+    if (parse_pattern(new_pattern_s, new_pattern, &new_pattern_len) < 0) {
+      fprintf(stderr,
+              "Invalid new pattern. Use digits 1..9 without repetition (min %d).\n",
+              PATTERN_MIN_POINTS);
+      return 1;
+    }
+    if (pattern_is_weak(new_pattern, new_pattern_len) && !allow_weak_pattern) {
+      fprintf(stderr,
+              "Weak new pattern rejected (obvious sequence/line).\n"
+              "Choose a less predictable pattern or pass --allow-weak-pattern.\n");
+      return 1;
+    }
+  }
+
+  if ((pin_opt != NULL) && (validate_pin(pin_opt) < 0)) {
+    fprintf(stderr, "Invalid PIN. Use 4 to 8 digits.\n");
+    return 1;
+  }
+  if ((pin_opt != NULL) && pin_is_weak(pin_opt) && !allow_weak_pin) {
+    fprintf(stderr,
+            "Weak PIN rejected (repetition/sequence).\n"
+            "Choose a less predictable PIN or pass --allow-weak-pin.\n");
+    return 1;
+  }
+  if ((pin_opt != NULL) && (strcmp(pin_opt, pattern_s) == 0)) {
+    fprintf(stderr, "PIN must differ from pattern string.\n");
+    return 1;
+  }
+
+  if ((new_pin_opt != NULL) && (validate_pin(new_pin_opt) < 0)) {
+    fprintf(stderr, "Invalid new PIN. Use 4 to 8 digits.\n");
+    return 1;
+  }
+  if ((new_pin_opt != NULL) && pin_is_weak(new_pin_opt) && !allow_weak_pin) {
+    fprintf(stderr,
+            "Weak new PIN rejected (repetition/sequence).\n"
+            "Choose a less predictable PIN or pass --allow-weak-pin.\n");
+    return 1;
+  }
+  if ((new_pin_opt != NULL) && rekey_cmd && (strcmp(new_pin_opt, new_pattern_s) == 0)) {
+    fprintf(stderr, "New PIN must differ from new pattern string.\n");
     return 1;
   }
 
@@ -665,18 +999,30 @@ int main(int argc, char **argv) {
   if (fp == NULL) {
     existing = 0;
     if ((strcmp(cmd, "list") == 0) || (strcmp(cmd, "del") == 0) ||
-        (strcmp(cmd, "rename") == 0)) {
+        (strcmp(cmd, "rename") == 0) || migrate_cmd) {
       fprintf(stderr, "File not found: %s\n", file_path);
       return 1;
     }
 
-    if (fill_random(salt, sizeof(salt)) < 0) {
+    memset(&meta, 0, sizeof(meta));
+    meta.version = TOKEN_BIN_VERSION_V2;
+    meta.pin_required = 1;
+    if (fill_random(meta.salt, sizeof(meta.salt)) < 0) {
       fprintf(stderr, "Unable to get random salt\n");
+      return 1;
+    }
+    if (meta.pin_required &&
+        (fill_random(meta.pin_salt, sizeof(meta.pin_salt)) < 0)) {
+      fprintf(stderr, "Unable to get random pin salt\n");
+      return 1;
+    }
+    if (pin_opt == NULL) {
+      fprintf(stderr, "PIN required for new vault. Use --pin <digits>.\n");
       return 1;
     }
   } else {
     existing = 1;
-    if (read_header(fp, salt, &count) < 0) {
+    if (read_header(fp, &meta, &count) < 0) {
       fprintf(stderr, "Invalid or unsupported tokens.bin\n");
       fclose(fp);
       return 1;
@@ -688,21 +1034,179 @@ int main(int argc, char **argv) {
     }
   }
 
-  derive_keys_from_pattern(pattern, pattern_len, salt, enc_key, mac_key);
+  if (migrate_cmd) {
+    if (!existing) {
+      fprintf(stderr, "migrate requires an existing file\n");
+      return 1;
+    }
+    if (meta.version == TOKEN_BIN_VERSION_V2) {
+      fprintf(stderr, "Vault is already v2 with PIN\n");
+      fclose(fp);
+      return 1;
+    }
+
+    derive_keys_from_pattern(pattern, pattern_len, meta.salt, old_enc_key,
+                             old_mac_key);
+    if (load_decrypted_entries(fp, count, old_enc_key, old_mac_key, entries,
+                               sizeof(entries) / sizeof(entries[0]),
+                               &entry_count) < 0) {
+      fprintf(stderr, "Wrong pattern for this vault, or file corrupted.\n");
+      fclose(fp);
+      return 1;
+    }
+    fclose(fp);
+
+    meta.version = TOKEN_BIN_VERSION_V2;
+    meta.pin_required = 1;
+    if (fill_random(meta.pin_salt, sizeof(meta.pin_salt)) < 0) {
+      fprintf(stderr, "Unable to get random pin salt\n");
+      return 1;
+    }
+
+    if (derive_keys_for_meta(&meta, pattern, pattern_len, pin_opt, enc_key,
+                             mac_key) < 0) {
+      fprintf(stderr, "Failed deriving migration keys\n");
+      return 1;
+    }
+    if (write_vault_file(file_path, &meta, enc_key, mac_key, entries,
+                         entry_count) < 0) {
+      fprintf(stderr, "Failed writing migrated vault\n");
+      return 1;
+    }
+
+    printf("Migrated %s to v2 (PIN required, count=%lu)\n", file_path,
+           (unsigned long)entry_count);
+    return 0;
+  }
 
   if (existing) {
+    if ((meta.version == TOKEN_BIN_VERSION_V1) && !migrate_cmd &&
+        (pin_opt == NULL)) {
+      fprintf(stderr,
+              "Legacy v1 vault detected. Provide --pin <digits> to upgrade to v2,\n"
+              "or run: migrate <tokens.bin> <pattern> <new_pin>.\n");
+      fclose(fp);
+      return 1;
+    }
+    if (meta.pin_required && (pin_opt == NULL)) {
+      fprintf(stderr, "This vault requires --pin <digits>.\n");
+      fclose(fp);
+      return 1;
+    }
+    if (derive_keys_for_meta(&meta, pattern, pattern_len, pin_opt, enc_key,
+                             mac_key) < 0) {
+      fprintf(stderr, "Failed deriving keys\n");
+      fclose(fp);
+      return 1;
+    }
     if (load_decrypted_entries(fp, count, enc_key, mac_key, entries,
                                sizeof(entries) / sizeof(entries[0]),
                                &entry_count) < 0) {
       fprintf(stderr,
-              "Wrong pattern for this vault, or file corrupted.\n"
-              "All entries in one tokens.bin must use the same pattern.\n");
+              "Wrong pattern/PIN for this vault, or file corrupted.\n"
+              "All entries in one tokens.bin must use the same secrets.\n");
       fclose(fp);
       return 1;
     }
     fclose(fp);
   } else {
+    if (derive_keys_for_meta(&meta, pattern, pattern_len,
+                             meta.pin_required ? pin_opt : NULL, enc_key,
+                             mac_key) < 0) {
+      fprintf(stderr, "Failed deriving keys for new vault\n");
+      return 1;
+    }
     entry_count = 0;
+  }
+
+  if (existing && (meta.version == TOKEN_BIN_VERSION_V1) && (pin_opt != NULL) &&
+      (strcmp(cmd, "list") != 0) && !migrate_cmd && !rekey_cmd) {
+    target_meta = meta;
+    target_meta.version = TOKEN_BIN_VERSION_V2;
+    target_meta.pin_required = 1;
+    if (fill_random(target_meta.pin_salt, sizeof(target_meta.pin_salt)) < 0) {
+      fprintf(stderr, "Unable to get random pin salt\n");
+      return 1;
+    }
+    if (derive_keys_for_meta(&target_meta, pattern, pattern_len, pin_opt,
+                             enc_key, mac_key) < 0) {
+      fprintf(stderr, "Failed deriving keys for v2 upgrade\n");
+      return 1;
+    }
+    meta = target_meta;
+    upgraded_to_v2 = 1;
+  }
+
+  if (rekey_cmd) {
+    int same_pattern =
+        (pattern_len == new_pattern_len) &&
+        (memcmp(pattern, new_pattern, pattern_len) == 0);
+
+    if (!existing) {
+      fprintf(stderr, "rekey requires an existing file\n");
+      return 1;
+    }
+
+    target_meta = meta;
+
+    if (meta.version == TOKEN_BIN_VERSION_V1) {
+      if (new_pin_opt == NULL) {
+        fprintf(stderr,
+                "Legacy v1 rekey requires --new-pin <digits> to upgrade to v2.\n");
+        return 1;
+      }
+      target_meta.version = TOKEN_BIN_VERSION_V2;
+      target_meta.pin_required = 1;
+      if (fill_random(target_meta.pin_salt, sizeof(target_meta.pin_salt)) < 0) {
+        fprintf(stderr, "Unable to get random pin salt\n");
+        return 1;
+      }
+      target_pin = new_pin_opt;
+      if (same_pattern && (strcmp(new_pin_opt, pattern_s) == 0)) {
+        fprintf(stderr,
+                "No effective change: new PIN must differ from pattern string.\n");
+        return 1;
+      }
+    } else if (meta.version == TOKEN_BIN_VERSION_V2) {
+      target_meta.pin_required = 1;
+      target_pin = (new_pin_opt != NULL) ? new_pin_opt : pin_opt;
+      if (new_pin_opt != NULL) {
+        if (fill_random(target_meta.pin_salt, sizeof(target_meta.pin_salt)) < 0) {
+          fprintf(stderr, "Unable to get random pin salt\n");
+          return 1;
+        }
+      }
+      if (same_pattern && (new_pin_opt == NULL)) {
+        fprintf(stderr,
+                "No effective change: new pattern and PIN unchanged.\n");
+        return 1;
+      }
+      if (same_pattern && (new_pin_opt != NULL) && (strcmp(new_pin_opt, pin_opt) == 0)) {
+        fprintf(stderr,
+                "No effective change: new PIN equals current PIN.\n");
+        return 1;
+      }
+    } else {
+      fprintf(stderr, "Unsupported vault version for rekey\n");
+      return 1;
+    }
+
+    if (derive_keys_for_meta(&target_meta, new_pattern, new_pattern_len,
+                             target_pin, enc_key, mac_key) < 0) {
+      fprintf(stderr, "Failed deriving target rekey keys\n");
+      return 1;
+    }
+
+    if (write_vault_file(file_path, &target_meta, enc_key, mac_key, entries,
+                         entry_count) < 0) {
+      fprintf(stderr, "Failed writing rekeyed vault\n");
+      return 1;
+    }
+
+    printf("Rekeyed %s (count=%lu, vault=v%u%s)\n", file_path,
+           (unsigned long)entry_count, (unsigned)target_meta.version,
+           target_meta.pin_required ? ", pin=on" : "");
+    return 0;
   }
 
   if (strcmp(cmd, "list") == 0) {
@@ -733,13 +1237,15 @@ int main(int argc, char **argv) {
     for (; (size_t)idx + 1 < entry_count; idx++)
       entries[idx] = entries[idx + 1];
     entry_count--;
-    if (write_vault_file(file_path, salt, enc_key, mac_key, entries,
+    if (write_vault_file(file_path, &meta, enc_key, mac_key, entries,
                          entry_count) < 0) {
       fprintf(stderr, "Failed writing updated vault\n");
       return 1;
     }
     printf("Deleted '%s' from %s (count=%lu)\n", label, file_path,
            (unsigned long)entry_count);
+    if (upgraded_to_v2)
+      printf("Vault upgraded to v2 with PIN.\n");
     return 0;
   }
 
@@ -760,7 +1266,7 @@ int main(int argc, char **argv) {
 
     snprintf(entries[idx].label, sizeof(entries[idx].label), "%s", new_label);
 
-    if (write_vault_file(file_path, salt, enc_key, mac_key, entries,
+    if (write_vault_file(file_path, &meta, enc_key, mac_key, entries,
                          entry_count) < 0) {
       fprintf(stderr, "Failed writing updated vault\n");
       return 1;
@@ -768,6 +1274,8 @@ int main(int argc, char **argv) {
 
     printf("Renamed '%s' -> '%s' in %s (count=%lu)\n", label, new_label,
            file_path, (unsigned long)entry_count);
+    if (upgraded_to_v2)
+      printf("Vault upgraded to v2 with PIN.\n");
     return 0;
   }
 
@@ -791,7 +1299,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     entries[entry_count++] = new_entry;
-  } else { /* set */
+  } else {
     if (idx >= 0) {
       entries[idx] = new_entry;
     } else {
@@ -803,14 +1311,17 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (write_vault_file(file_path, salt, enc_key, mac_key, entries, entry_count) <
-      0) {
+  if (write_vault_file(file_path, &meta, enc_key, mac_key, entries,
+                       entry_count) < 0) {
     fprintf(stderr, "Failed writing vault\n");
     return 1;
   }
 
-  printf("%s token '%s' in %s (count=%lu)\n",
+  printf("%s token '%s' in %s (count=%lu, vault=v%u%s)\n",
          (strcmp(cmd, "add") == 0) ? "Added" : "Updated", label, file_path,
-         (unsigned long)entry_count);
+         (unsigned long)entry_count, (unsigned)meta.version,
+         meta.pin_required ? ", pin=on" : "");
+  if (upgraded_to_v2)
+    printf("Vault upgraded to v2 with PIN.\n");
   return 0;
 }

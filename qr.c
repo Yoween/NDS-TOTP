@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include "qr.h"
 
 #include "totp.h"
@@ -5,6 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * otpauth URI parser with conservative validation:
+ * - decodes URL encoding
+ * - accepts flexible base32 input
+ * - enforces SHA1 / 6 digits / sane periods for DS compatibility
+ */
 
 static int hex_val(char c) {
   if ((c >= '0') && (c <= '9'))

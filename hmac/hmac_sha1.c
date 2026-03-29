@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /**
 * @file hmac_sha1.c  Implements HMAC-SHA1 as of RFC 2202
 *

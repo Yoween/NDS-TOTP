@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #ifndef NDS_TOTP_APP_H
 #define NDS_TOTP_APP_H
 
@@ -5,18 +7,32 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*
+ * Core shared constants and runtime state for the DS application.
+ *
+ * Notes:
+ * - `app_state_t` only stores unlocked material in RAM during runtime.
+ * - Time display uses `time_correction_seconds`, derived from user settings.
+ */
+
 #define MAX_TOKENS 32
 #define MAX_LABEL_LEN 63
 #define MAX_KEY_LEN 64
 #define LINE_BUF_LEN 256
 
 #define TOKEN_BIN_MAGIC "NTB1"
-#define TOKEN_BIN_VERSION 1
+#define TOKEN_BIN_VERSION_V1 1
+#define TOKEN_BIN_VERSION_V2 2
+#define TOKEN_BIN_VERSION TOKEN_BIN_VERSION_V2
 #define TOKEN_SALT_LEN 16
+#define TOKEN_PIN_SALT_LEN 16
 #define TOKEN_NONCE_LEN 8
 #define TOKEN_TAG_LEN 16
-#define PATTERN_MIN_POINTS 4
+#define PATTERN_MIN_POINTS 5
 #define PATTERN_MAX_POINTS 9
+#define PIN_MIN_LEN 4
+#define PIN_MAX_LEN 8
+#define PIN_INPUT_LEN PIN_MAX_LEN
 #define KDF_ROUNDS 2048
 
 /* Touch pattern calibration */
@@ -54,6 +70,8 @@ typedef struct token_s {
 typedef struct app_state_s {
   PrintConsole top_console;
   PrintConsole bottom_console;
+  int tz_offset_minutes;
+  int dst_enabled;
   int time_correction_seconds;
   uint8_t enc_key[20];
   uint8_t mac_key[20];

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include "camera_scan.h"
 
 #include "gui.h"
@@ -10,6 +12,13 @@
 #ifndef QR_DETECT_ONLY
 #define QR_DETECT_ONLY 0
 #endif
+
+/*
+ * Camera capture pipeline:
+ * - preview frame in RGB555
+ * - grayscale conversion for quirc
+ * - decode loop with stall recovery and camera switch support
+ */
 
 static struct quirc_code g_qr_code;
 static struct quirc_data g_qr_data;
@@ -95,6 +104,7 @@ int scan_otpauth_qr(app_state_t *app, char *out_uri, size_t out_cap, char *err,
 
   cameraTransferStart(frame, CAPTURE_MODE_PREVIEW);
 
+  /* Bounded loop avoids endless camera lockups and keeps cancel responsive. */
   for (frame_idx = 0; frame_idx < 1200; frame_idx++) {
     int keys;
     int w;

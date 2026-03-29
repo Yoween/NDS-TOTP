@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /**
 * @file re_hmac.h  Interface to HMAC functions
 *

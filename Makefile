@@ -26,7 +26,7 @@ HOSTCC := gcc
 PACKER := tools/totp-pack
 ARM7_APP_ELF := $(TARGET)-arm7.elf
 
-SRCS := main.c gui.c crypto.c camera_scan.c qr.c totp.c hmac/hmac_sha1.c sha/sha1.c \
+SRCS := main.c gui.c crypto.c config.c camera_scan.c qr.c totp.c hmac/hmac_sha1.c sha/sha1.c \
 	dsi_camera/arm9/source/camera.c \
 	quirc/lib/quirc.c \
 	quirc/lib/decode.c \

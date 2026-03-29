@@ -1,7 +1,16 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #ifndef NDS_TOTP_GUI_H
 #define NDS_TOTP_GUI_H
 
 #include "app.h"
+
+/*
+ * Text UI module:
+ * - lock/unlock interaction (pattern + PIN)
+ * - top/bottom screen rendering
+ * - status rows and lightweight drawing helpers
+ */
 
 void gui_init_text_consoles(app_state_t *app);
 void gui_restore_text_consoles(app_state_t *app);

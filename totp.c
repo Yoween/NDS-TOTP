@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /*
  *  TOTP: Time-Based One-Time Password Algorithm
  *  Copyright (c) 2019-2025, Michael Santos <michael.santos@gmail.com>
@@ -11,6 +13,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* RFC 6238-compatible TOTP primitives used by both app and packer paths. */
 
 static const int8_t base32_vals[256] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -174,6 +178,7 @@ uint32_t compute_totp(const token_t *token, time_t now) {
   if (elapsed < 0)
     return 0;
 
+  /* HOTP moving factor for current time window. */
   counter = (uint64_t)(elapsed / (int64_t)token->interval);
 
   msg[0] = (uint8_t)((counter >> 56) & 0xFF);

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+
 #include "gui.h"
 
 #include "crypto.h"
@@ -6,6 +8,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * UI module for dual-screen text rendering and unlock workflow.
+ *
+ * Rendering strategy avoids full-screen clears each frame to reduce flicker:
+ * only changed rows/regions are overwritten during refresh.
+ */
+
+static void secure_zero(void *ptr, size_t len) {
+  volatile uint8_t *p = (volatile uint8_t *)ptr;
+  while (len-- > 0)
+    *p++ = 0;
+}
 
 static int touch_to_pattern_cell(int x, int y) {
   const int cell_w = SCREEN_WIDTH / TOUCH_CELL_W_DIV;
@@ -42,6 +57,7 @@ static int touch_to_pattern_cell(int x, int y) {
     }
   }
 
+  /* Ignore touches too far from the center of any pattern node. */
   if ((best_dx > hit_w) || (best_dy > hit_h))
     return -1;
 
@@ -130,9 +146,126 @@ static void draw_unlock_screen(app_state_t *app, const uint8_t visited[9],
   gui_bottom_at(23, 1, "START: quit");
 }
 
+static void draw_pin_screen(app_state_t *app, const char pin[PIN_MAX_LEN + 1],
+                            size_t cursor, const char *status) {
+  size_t i;
+  size_t pin_len = PIN_MAX_LEN;
+
+  while ((pin_len > 0) && (pin[pin_len - 1] == ' '))
+    pin_len--;
+
+  consoleSelect(&app->top_console);
+  iprintf("\x1b[2J");
+  gui_top_at(1, 1, "NDS-TOTP LOCKED");
+  gui_top_at(3, 1, "PIN required");
+  clear_top_row(5);
+  if ((status != NULL) && (status[0] != '\0'))
+    gui_top_at(5, 1, "%s", status);
+
+  consoleSelect(&app->bottom_console);
+  printf("\x1b[2J");
+  gui_bottom_at(1, 1, "Enter PIN (digits)");
+  gui_bottom_at(2, 1, "LEFT/RIGHT move");
+  gui_bottom_at(3, 1, "UP/DOWN: digit/blank");
+  gui_bottom_at(4, 1, "A: confirm  B: cancel");
+  gui_bottom_at(6, 1, "Length: %lu (%d-%d)", (unsigned long)pin_len,
+                PIN_MIN_LEN, PIN_MAX_LEN);
+
+  for (i = 0; i < PIN_MAX_LEN; i++) {
+    int col = 4 + (int)i * 3;
+    gui_bottom_at(10, col, "%c", (pin[i] == ' ') ? '_' : pin[i]);
+  }
+  gui_bottom_at(12, 4 + (int)cursor * 3, "^");
+  gui_bottom_at(23, 1, "START: quit");
+}
+
+static int gui_prompt_pin(app_state_t *app, char out_pin[PIN_MAX_LEN + 1]) {
+  char pin[PIN_MAX_LEN + 1];
+  char status[32];
+  size_t cursor = 0;
+
+  memset(pin, ' ', PIN_MAX_LEN);
+  pin[PIN_MAX_LEN] = '\0';
+
+  status[0] = '\0';
+  while (1) {
+    int kd;
+    int kr;
+
+    scanKeys();
+    kd = keysDown();
+    kr = keysDownRepeat();
+
+    if (kd & KEY_START) {
+      secure_zero(pin, sizeof(pin));
+      return -3;
+    }
+#ifdef KEY_POWER
+    if (kd & KEY_POWER) {
+      secure_zero(pin, sizeof(pin));
+      return -3;
+    }
+#endif
+
+    if ((kd | kr) & KEY_LEFT) {
+      if (cursor == 0)
+        cursor = PIN_MAX_LEN - 1;
+      else
+        cursor--;
+    }
+    if ((kd | kr) & KEY_RIGHT)
+      cursor = (cursor + 1) % PIN_MAX_LEN;
+
+    if ((kd | kr) & KEY_UP) {
+      if (pin[cursor] == ' ')
+        pin[cursor] = '0';
+      else if (pin[cursor] == '9')
+        pin[cursor] = ' ';
+      else
+        pin[cursor]++;
+    }
+    if ((kd | kr) & KEY_DOWN) {
+      if (pin[cursor] == ' ')
+        pin[cursor] = '9';
+      else if (pin[cursor] == '0')
+        pin[cursor] = ' ';
+      else
+        pin[cursor]--;
+    }
+
+    if (kd & KEY_B) {
+      secure_zero(pin, sizeof(pin));
+      return -1;
+    }
+
+    if (kd & KEY_A) {
+      size_t pin_len = 0;
+      size_t i;
+
+      /* Compact sparse user input (blanks) into a contiguous numeric PIN. */
+      for (i = 0; i < PIN_MAX_LEN; i++) {
+        if (pin[i] != ' ')
+          out_pin[pin_len++] = pin[i];
+      }
+      out_pin[pin_len] = '\0';
+
+      if (pin_len < PIN_MIN_LEN) {
+        strncpy(status, "PIN too short", sizeof(status) - 1);
+        status[sizeof(status) - 1] = '\0';
+      } else {
+        secure_zero(pin, sizeof(pin));
+        return 0;
+      }
+    }
+
+    draw_pin_screen(app, pin, cursor, status);
+    swiWaitForVBlank();
+  }
+}
+
 int gui_unlock_and_load_tokens(app_state_t *app, token_t *tokens, size_t *count,
                                const char **loaded_path) {
-  uint8_t salt[TOKEN_SALT_LEN];
+  vault_meta_t meta;
   uint8_t pattern[PATTERN_MAX_POINTS];
   uint8_t visited[9];
   size_t pattern_len = 0;
@@ -142,8 +275,12 @@ int gui_unlock_and_load_tokens(app_state_t *app, token_t *tokens, size_t *count,
 
   status[0] = '\0';
 
-  if (read_tokens_bin_salt(salt, loaded_path) < 0)
+  if (read_tokens_bin_meta(&meta, loaded_path) < 0)
     return -1;
+  if ((meta.version != TOKEN_BIN_VERSION_V2) || !meta.pin_required) {
+    secure_zero(&meta, sizeof(meta));
+    return -4;
+  }
 
   memset(visited, 0, sizeof(visited));
 
@@ -158,11 +295,19 @@ int gui_unlock_and_load_tokens(app_state_t *app, token_t *tokens, size_t *count,
     ku = keysUp();
     kh = keysHeld();
 
-    if (kd & KEY_START)
-      exit(0);
+    if (kd & KEY_START) {
+      secure_zero(pattern, sizeof(pattern));
+      secure_zero(visited, sizeof(visited));
+      secure_zero(&meta, sizeof(meta));
+      return -3;
+    }
 #ifdef KEY_POWER
-    if (kd & KEY_POWER)
-      exit(0);
+    if (kd & KEY_POWER) {
+      secure_zero(pattern, sizeof(pattern));
+      secure_zero(visited, sizeof(visited));
+      secure_zero(&meta, sizeof(meta));
+      return -3;
+    }
 #endif
 
     if (kh & KEY_TOUCH) {
@@ -186,8 +331,46 @@ int gui_unlock_and_load_tokens(app_state_t *app, token_t *tokens, size_t *count,
         uint8_t try_mac[20];
         size_t tmp_count = 0;
         const char *tmp_path = NULL;
+        char pin[PIN_MAX_LEN + 1];
+        const char *pin_ptr = NULL;
 
-        derive_keys_from_pattern(pattern, pattern_len, salt, try_enc, try_mac);
+        memset(pin, 0, sizeof(pin));
+        if (meta.pin_required) {
+          int pin_rc = gui_prompt_pin(app, pin);
+          if (pin_rc == -3) {
+            secure_zero(try_enc, sizeof(try_enc));
+            secure_zero(try_mac, sizeof(try_mac));
+            secure_zero(pin, sizeof(pin));
+            secure_zero(pattern, sizeof(pattern));
+            secure_zero(visited, sizeof(visited));
+            secure_zero(&meta, sizeof(meta));
+            return -3;
+          }
+          if (pin_rc < 0) {
+            strncpy(status, "PIN cancelled", sizeof(status) - 1);
+            status[sizeof(status) - 1] = '\0';
+            memset(visited, 0, sizeof(visited));
+            memset(pattern, 0, sizeof(pattern));
+            pattern_len = 0;
+            secure_zero(pin, sizeof(pin));
+            continue;
+          }
+          pin_ptr = pin;
+        }
+
+        if (derive_keys_for_vault(&meta, pattern, pattern_len, pin_ptr, try_enc,
+                                  try_mac) < 0) {
+          secure_zero(try_enc, sizeof(try_enc));
+          secure_zero(try_mac, sizeof(try_mac));
+          secure_zero(pin, sizeof(pin));
+          strncpy(status, "Vault metadata error", sizeof(status) - 1);
+          status[sizeof(status) - 1] = '\0';
+          memset(visited, 0, sizeof(visited));
+          memset(pattern, 0, sizeof(pattern));
+          pattern_len = 0;
+          continue;
+        }
+
         if (load_tokens_bin_with_keys(tokens, &tmp_count, &tmp_path, try_enc,
                                       try_mac) == 0) {
           memcpy(app->enc_key, try_enc, sizeof(app->enc_key));
@@ -195,12 +378,29 @@ int gui_unlock_and_load_tokens(app_state_t *app, token_t *tokens, size_t *count,
           app->has_unlocked_keys = 1;
           *count = tmp_count;
           *loaded_path = tmp_path;
+          secure_zero(try_enc, sizeof(try_enc));
+          secure_zero(try_mac, sizeof(try_mac));
+          secure_zero(pin, sizeof(pin));
+          secure_zero(pattern, sizeof(pattern));
+          secure_zero(visited, sizeof(visited));
+          secure_zero(&meta, sizeof(meta));
           return 0;
         }
 
+        secure_zero(try_enc, sizeof(try_enc));
+        secure_zero(try_mac, sizeof(try_mac));
+        secure_zero(pin, sizeof(pin));
+
         attempts_left--;
-        strncpy(status, "Wrong pattern", sizeof(status) - 1);
+        strncpy(status, meta.pin_required ? "Wrong pattern/PIN" : "Wrong pattern",
+                sizeof(status) - 1);
         status[sizeof(status) - 1] = '\0';
+
+        {
+          int backoff_frames = (8 - attempts_left) * 20;
+          while (backoff_frames-- > 0)
+            swiWaitForVBlank();
+        }
       }
 
       memset(visited, 0, sizeof(visited));
@@ -212,11 +412,15 @@ int gui_unlock_and_load_tokens(app_state_t *app, token_t *tokens, size_t *count,
     swiWaitForVBlank();
   }
 
+  secure_zero(pattern, sizeof(pattern));
+  secure_zero(visited, sizeof(visited));
+  secure_zero(&meta, sizeof(meta));
   return -2;
 }
 
 void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
                  size_t selected) {
+  static int bottom_ui_initialized = 0;
   size_t i;
   size_t start;
   size_t end;
@@ -235,6 +439,13 @@ void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
   time_t raw_now;
   time_t now;
   int64_t corrected_now;
+  int tzm;
+  char tz_sign;
+
+  tzm = app->tz_offset_minutes;
+  tz_sign = (tzm < 0) ? '-' : '+';
+  if (tzm < 0)
+    tzm = -tzm;
 
   raw_now = time(NULL);
   corrected_now = (int64_t)raw_now + (int64_t)app->time_correction_seconds;
@@ -242,16 +453,19 @@ void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
 
   consoleSelect(&app->top_console);
   iprintf("\x1b[2J");
-  gui_top_at(1, 1, "DSi TOTP");
+  gui_top_at(1, 1, "NDS-TOTP");
   gui_top_at(3, 1, "Raw unix:   %ld", (long)raw_now);
   gui_top_at(4, 1, "Adjusted:   %ld", (long)now);
-  gui_top_at(5, 1, "Correction: %+d", app->time_correction_seconds);
+  gui_top_at(5, 1, "TZ: UTC%c%d:%02d DST:%s", tz_sign, tzm / 60, tzm % 60,
+             app->dst_enabled ? "on" : "off");
+  gui_top_at(6, 1, "Correction: %+d", app->time_correction_seconds);
 
   if (count == 0) {
-    gui_top_at(6, 1, "No tokens loaded");
+    gui_top_at(7, 1, "No tokens loaded");
     gui_top_at(12, 1, "A: reload");
     gui_top_at(13, 1, "Y:scan QR");
     gui_top_at(14, 1, "X:delete (none)");
+    gui_top_at(15, 1, "L/R: UTC -/+1h  SELECT:DST");
     clear_top_row(18);
     if (app->status_msg[0] != '\0')
       gui_top_at(18, 1, "%s", app->status_msg);
@@ -285,6 +499,7 @@ void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
     gui_top_at(12, 1, "UP/DOWN: select");
     gui_top_at(13, 1, "A: reload");
     gui_top_at(14, 1, "X:delete selected  Y:scan QR");
+    gui_top_at(15, 1, "L/R: UTC -/+1h  SELECT:DST");
     clear_top_row(18);
     if (app->status_msg[0] != '\0')
       gui_top_at(18, 1, "%s", app->status_msg);
@@ -292,7 +507,6 @@ void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
   }
 
   consoleSelect(&app->bottom_console);
-  printf("\x1b[2J");
 
   if (count > 0) {
     const token_t *tok;
@@ -312,7 +526,15 @@ void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
     else
       remain = tok->interval - ((uint32_t)elapsed % tok->interval);
 
-    gui_bottom_at(1, 1, "Refresh: %lus", (unsigned long)remain);
+    /* One-shot clear when entering non-empty mode prevents stale overlays. */
+    if (!bottom_ui_initialized) {
+      int r;
+      for (r = 1; r <= 23; r++)
+        gui_clear_bottom_row(r);
+      bottom_ui_initialized = 1;
+    }
+
+    gui_bottom_at(1, 1, "Refresh: %3lus", (unsigned long)remain);
 
     list_top_row = 1 + top_info_rows + top_padding_rows;
     list_bottom_row = code_row - gap_before_code - 1;
@@ -396,6 +618,10 @@ void gui_draw_ui(app_state_t *app, const token_t *tokens, size_t count,
 
     gui_bottom_at(22, 13, "%06lu", (unsigned long)code);
   } else {
+    int r;
+    for (r = 1; r <= 23; r++)
+      gui_clear_bottom_row(r);
     gui_bottom_at(1, 1, "No tokens loaded");
+    bottom_ui_initialized = 0;
   }
 }
